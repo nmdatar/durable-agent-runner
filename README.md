@@ -24,3 +24,24 @@ Running the command again starts from `plan`. There is no database or checkpoint
 from which to resume yet. A crash after `publish` also illustrates a more subtle
 problem: the external effect may have happened even though the runner never
 recorded completion.
+
+## Durable workflow
+
+The SQLite-backed runner resumes at the first unfinished step. Initialize a local
+database and start a run that crashes after `collect`:
+
+```bash
+uv run runner init
+uv run runner start demo --crash-after collect
+```
+
+Copy the printed run ID, inspect its persisted state, and resume it:
+
+```bash
+uv run runner inspect <run-id>
+uv run runner events <run-id>
+uv run runner resume <run-id>
+```
+
+The resumed process skips `plan` and `collect` because their outputs were committed
+to SQLite before the simulated crash.
