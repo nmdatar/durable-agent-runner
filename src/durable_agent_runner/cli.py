@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from durable_agent_runner.demo import DemoServices, build_demo_workflow
 from durable_agent_runner.durable_runner import DurableRunner
+from durable_agent_runner.operations import IdempotentPublisher
 from durable_agent_runner.runner import InMemoryRunner, RunnerEvent, SimulatedCrash
 from durable_agent_runner.storage import SQLiteStore
 from durable_agent_runner.worker import Worker
@@ -62,6 +63,11 @@ def build_parser() -> argparse.ArgumentParser:
     worker.add_argument("--worker-id", help="stable identity to record with the lease")
     worker.add_argument("--lease-seconds", type=int, default=30)
     worker.add_argument("--crash-before-commit", choices=STEP_NAMES)
+    worker.add_argument(
+        "--crash-after-side-effect",
+        action="store_true",
+        help="crash publish after the external effect but before recording its result",
+    )
     failure = worker.add_mutually_exclusive_group()
     failure.add_argument("--retryable-failure", choices=STEP_NAMES)
     failure.add_argument("--terminal-failure", choices=STEP_NAMES)
@@ -80,16 +86,26 @@ def open_store(path: Path) -> SQLiteStore:
 
 
 def resolve_demo_workflow(
-    workflow_name: str,
+    claim,
+    store: SQLiteStore,
     *,
     failure_step: str | None = None,
     failure_kind: str | None = None,
+    crash_after_effect: bool = False,
 ):
-    if workflow_name != "demo-research":
-        raise ValueError(f"unknown workflow: {workflow_name}")
+    if claim.workflow_name != "demo-research":
+        raise ValueError(f"unknown workflow: {claim.workflow_name}")
     return build_demo_workflow(
         "Why durability matters",
-        DemoServices(failure_step=failure_step, failure_kind=failure_kind),
+        DemoServices(
+            failure_step=failure_step,
+            failure_kind=failure_kind,
+            publisher=IdempotentPublisher(
+                store,
+                claim.run_id,
+                crash_after_effect=crash_after_effect,
+            ),
+        ),
     )
 
 
@@ -99,7 +115,7 @@ def run_durable(
     *,
     crash_after: str | None,
 ) -> int:
-    services = DemoServices()
+    services = DemoServices(publisher=IdempotentPublisher(store, run_id))
     workflow = build_demo_workflow("Why durability matters", services)
     runner = DurableRunner(store, observer=print_event)
     try:
@@ -179,10 +195,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         failure_kind = "retryable" if args.retryable_failure else "terminal"
         worker = Worker(
             store,
-            lambda workflow_name: resolve_demo_workflow(
-                workflow_name,
+            lambda claim: resolve_demo_workflow(
+                claim,
+                store,
                 failure_step=failure_step,
                 failure_kind=failure_kind if failure_step else None,
+                crash_after_effect=args.crash_after_side_effect,
             ),
             worker_id=worker_id,
             observer=print_event,

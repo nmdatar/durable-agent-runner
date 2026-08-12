@@ -72,3 +72,20 @@ A terminal failure skips retry and fails the entire run:
 ```bash
 uv run runner worker --once --run-id <run-id> --terminal-failure plan
 ```
+
+## Idempotent side effects
+
+The publish step derives a stable key from `<run-id>:publish:v1`. The operation
+ledger records intent and result, while the fake external publisher returns the
+same publication for repeated requests with that key.
+
+To simulate a crash after publishing but before recording the operation result,
+complete the first three steps and run:
+
+```bash
+uv run runner worker --once --run-id <run-id> \
+  --lease-seconds 5 --crash-after-side-effect
+```
+
+After the lease expires, run a normal worker. It re-executes `publish`, receives
+the original publication ID, and completes without creating a duplicate.

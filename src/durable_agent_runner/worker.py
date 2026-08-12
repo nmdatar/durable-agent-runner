@@ -10,7 +10,7 @@ from durable_agent_runner.errors import RetryableStepError
 from durable_agent_runner.runner import EventObserver, RunnerEvent, SimulatedCrash, Workflow
 from durable_agent_runner.storage import ClaimedStep, SQLiteStore
 
-WorkflowResolver = Callable[[str], Workflow]
+WorkflowResolver = Callable[[ClaimedStep], Workflow]
 Clock = Callable[[], datetime]
 
 
@@ -97,7 +97,7 @@ class Worker:
         if claim is None:
             return None
 
-        workflow = self._resolve_workflow(claim.workflow_name)
+        workflow = self._resolve_workflow(claim)
         self._store.validate_workflow(
             claim.run_id,
             workflow.name,
@@ -114,6 +114,8 @@ class Worker:
         try:
             with LeaseHeartbeat(self._store, claim, lease_duration):
                 output = step.execute(outputs)
+        except SimulatedCrash:
+            raise
         except Exception as error:
             now = self._clock()
             policy = step.retry_policy

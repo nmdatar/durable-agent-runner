@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from durable_agent_runner.errors import RetryableStepError, TerminalStepError
+from durable_agent_runner.operations import IdempotentPublisher
 from durable_agent_runner.runner import Step, Workflow
 
 
@@ -15,6 +16,7 @@ class DemoServices:
     publications: list[str] = field(default_factory=list)
     failure_step: str | None = None
     failure_kind: str | None = None
+    publisher: IdempotentPublisher | None = None
 
     def _maybe_fail(self, step_name: str) -> None:
         if self.failure_step != step_name:
@@ -38,6 +40,8 @@ class DemoServices:
 
     def publish(self, report: str) -> str:
         self._maybe_fail("publish")
+        if self.publisher is not None:
+            return self.publisher.publish(report)
         publication_id = f"publication-{len(self.publications) + 1}"
         self.publications.append(report)
         return publication_id

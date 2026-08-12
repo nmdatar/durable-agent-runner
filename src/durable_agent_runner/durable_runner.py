@@ -42,9 +42,9 @@ class DurableRunner:
         step_names = [step.name for step in workflow.steps]
         self._store.validate_workflow(run_id, workflow.name, step_names)
 
-        def resolve_workflow(stored_name: str) -> Workflow:
-            if stored_name != workflow.name:
-                raise ValueError(f"unknown workflow: {stored_name}")
+        def resolve_workflow(claim) -> Workflow:
+            if claim.workflow_name != workflow.name:
+                raise ValueError(f"unknown workflow: {claim.workflow_name}")
             return workflow
 
         worker = Worker(

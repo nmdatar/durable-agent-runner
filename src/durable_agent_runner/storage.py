@@ -51,6 +51,13 @@ class ClaimedStep:
     attempt_count: int
 
 
+@dataclass(frozen=True)
+class OperationSnapshot:
+    idempotency_key: str
+    status: str
+    result: Any | None
+
+
 class SQLiteStore:
     """Store current state and append-only events in the same database."""
 
@@ -106,6 +113,24 @@ class SQLiteStore:
                     payload_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS operations (
+                    idempotency_key TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                    step_name TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    result_json TEXT,
+                    created_at TEXT NOT NULL,
+                    completed_at TEXT
+                );
+
+                -- This table emulates a durable external publishing service.
+                CREATE TABLE IF NOT EXISTS publications (
+                    idempotency_key TEXT PRIMARY KEY,
+                    publication_id TEXT NOT NULL UNIQUE,
+                    report TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 """
             )
             columns = {
@@ -125,7 +150,7 @@ class SQLiteStore:
             if "last_error" not in columns:
                 connection.execute("ALTER TABLE steps ADD COLUMN last_error TEXT")
             connection.execute("DELETE FROM schema_version")
-            connection.execute("INSERT INTO schema_version(version) VALUES (3)")
+            connection.execute("INSERT INTO schema_version(version) VALUES (4)")
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_steps_claimable
@@ -215,6 +240,89 @@ class SQLiteStore:
             )
             for row in rows
         ]
+
+    def get_operation(self, idempotency_key: str) -> OperationSnapshot | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT idempotency_key, status, result_json
+                FROM operations
+                WHERE idempotency_key = ?
+                """,
+                (idempotency_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        return OperationSnapshot(
+            idempotency_key=row["idempotency_key"],
+            status=row["status"],
+            result=json.loads(row["result_json"])
+            if row["result_json"] is not None
+            else None,
+        )
+
+    def begin_operation(self, run_id: str, step_name: str, idempotency_key: str) -> None:
+        """Record intent before contacting an external system."""
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO operations(
+                    idempotency_key, run_id, step_name, status, created_at
+                ) VALUES (?, ?, ?, 'started', ?)
+                """,
+                (idempotency_key, run_id, step_name, utc_now()),
+            )
+
+    def complete_operation(self, idempotency_key: str, result: Any) -> None:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE operations
+                SET status = 'completed', result_json = ?, completed_at = ?
+                WHERE idempotency_key = ?
+                """,
+                (json.dumps(result), utc_now(), idempotency_key),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"unknown operation: {idempotency_key}")
+
+    def publish_once(self, idempotency_key: str, report: str) -> str:
+        """Emulate an external API that honors an idempotency key."""
+        with self._connect() as connection:
+            existing = connection.execute(
+                """
+                SELECT publication_id, report
+                FROM publications
+                WHERE idempotency_key = ?
+                """,
+                (idempotency_key,),
+            ).fetchone()
+            if existing is not None:
+                if existing["report"] != report:
+                    raise ValueError("idempotency key was reused with different input")
+                return existing["publication_id"]
+
+            publication_id = f"publication-{uuid4()}"
+            connection.execute(
+                """
+                INSERT INTO publications(
+                    idempotency_key, publication_id, report, created_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (idempotency_key, publication_id, report, utc_now()),
+            )
+            return publication_id
+
+    def count_publications(self, idempotency_key: str | None = None) -> int:
+        with self._connect() as connection:
+            if idempotency_key is None:
+                return connection.execute(
+                    "SELECT COUNT(*) FROM publications"
+                ).fetchone()[0]
+            return connection.execute(
+                "SELECT COUNT(*) FROM publications WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()[0]
 
     def validate_workflow(self, run_id: str, workflow_name: str, step_names: Sequence[str]) -> None:
         run = self.get_run(run_id)

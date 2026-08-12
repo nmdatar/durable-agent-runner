@@ -29,7 +29,7 @@ def make_runner(tmp_path, action, policy=None):
     clock = ManualClock()
     worker = Worker(
         store,
-        lambda _name: workflow,
+        lambda _claim: workflow,
         worker_id="retry-worker",
         clock=clock,
     )

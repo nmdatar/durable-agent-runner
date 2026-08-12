@@ -24,7 +24,7 @@ def test_database_initialization_is_safe_to_repeat(tmp_path) -> None:
         versions = connection.execute(
             "SELECT version FROM schema_version"
         ).fetchall()
-    assert versions == [(3,)]
+    assert versions == [(4,)]
 
 
 def test_second_worker_cannot_claim_a_step_with_a_live_lease(tmp_path) -> None:
@@ -111,7 +111,7 @@ def test_separate_workers_can_finish_one_workflow(tmp_path) -> None:
     workflow = build_demo_workflow("Test task", services)
     run_id = DurableRunner(store).create_run(workflow)
 
-    def resolve_workflow(_name: str):
+    def resolve_workflow(_claim):
         return workflow
 
     results = [
