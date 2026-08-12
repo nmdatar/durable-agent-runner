@@ -1,135 +1,92 @@
 # Durable Agent Runner
 
-A teaching project for learning how long-running agent workflows survive crashes,
-retries, and duplicated work.
+A teaching implementation of the correctness layer beneath a long-running agent.
+It persists workflow progress, coordinates workers with expiring leases, retries
+transient failures, protects supported side effects with idempotency keys, verifies
+file artifacts, enforces run controls, and demonstrates recovery under crashes.
 
-The project is built one durability concept at a time. Its current runner is an
-intentionally non-durable baseline: all progress exists only in process memory.
+This is intentionally a small single-machine system. It explains durable execution;
+it is not a production service or a persistent VM platform.
 
-## Development
+## Quick start
+
+Requirements: Python 3.11+ and [`uv`](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync
 uv run pytest
-uv run runner demo
-```
-
-To simulate a process dying after its `collect` step:
-
-```bash
-uv run runner demo --crash-after collect
-```
-
-Running the command again starts from `plan`. There is no database or checkpoint
-from which to resume yet. A crash after `publish` also illustrates a more subtle
-problem: the external effect may have happened even though the runner never
-recorded completion.
-
-## Durable workflow with workers
-
-The SQLite-backed scheduler stores work until a worker claims it. Initialize a local
-database and enqueue a run:
-
-```bash
 uv run runner init
 uv run runner start demo
 ```
 
-Copy the printed run ID. Each invocation below claims and executes one eligible step:
+`start` prints a run UUID. Use that UUID in place of `<run-id>` below. Each worker
+invocation executes at most one eligible step:
 
 ```bash
 uv run runner worker --once --run-id <run-id>
-uv run runner worker --once --run-id <run-id>
-uv run runner worker --once --run-id <run-id>
-uv run runner worker --once --run-id <run-id>
-```
-
-Inspect current state or durable history at any point:
-
-```bash
 uv run runner inspect <run-id>
 uv run runner events <run-id>
 ```
 
-Every claim has an owner and expiration time. A second worker cannot execute the
-same step while its lease remains valid. Long-running workers heartbeat to extend
-their leases, while work held by a dead worker becomes claimable after expiration.
+The demo has four sequential steps:
 
-## Durable retries
-
-Steps default to three attempts with exponential backoff. A retryable failure is
-persisted as `waiting_retry`; workers cannot claim it until `next_attempt_at`.
-
-```bash
-uv run runner worker --once --run-id <run-id> --retryable-failure plan
-uv run runner inspect <run-id>
-# Wait for the displayed next-attempt time, then omit failure injection:
-uv run runner worker --once --run-id <run-id>
+```text
+plan → collect → write_report → publish
 ```
 
-A terminal failure skips retry and fails the entire run:
+Run four workers to finish it, or let workers omit `--run-id` to claim the oldest
+eligible step from any run.
 
-```bash
-uv run runner worker --once --run-id <run-id> --terminal-failure plan
+## What to read
+
+- [Architecture](docs/ARCHITECTURE.md) — components, data model, state machines,
+  transaction boundaries, and the relationship to sandbox infrastructure.
+- [Failure semantics](docs/FAILURE_SEMANTICS.md) — guarantees, crash behavior,
+  retries, leases, idempotency, and known limitations.
+- [Hands-on guide](docs/HANDS_ON.md) — reproducible exercises for every feature.
+- [CLI reference](docs/CLI.md) — commands, options, defaults, and exit behavior.
+- [Extending the runner](docs/EXTENDING.md) — workflows, steps, retry policies,
+  budgets, side effects, and artifacts.
+
+## Useful commands
+
+```text
+runner demo       Run the intentionally non-durable baseline
+runner init       Initialize or migrate the SQLite database
+runner start      Enqueue a durable run
+runner worker     Claim and execute one step
+runner resume     Drain one stored run in the current process
+runner inspect    Show current state, usage, and errors
+runner events     Show durable event history
+runner artifacts  List checksummed files produced by a run
+runner cancel     Prevent a run from claiming more work
+runner chaos      Exercise four crash boundaries and verify recovery
 ```
 
-## Idempotent side effects
+Run `uv run runner <command> --help` for command-specific options.
 
-The publish step derives a stable key from `<run-id>:publish:v1`. The operation
-ledger records intent and result, while the fake external publisher returns the
-same publication for repeated requests with that key.
+## Core result
 
-To simulate a crash after publishing but before recording the operation result,
-complete the first three steps and run:
+The runner provides **at-least-once step execution**:
 
-```bash
-uv run runner worker --once --run-id <run-id> \
-  --lease-seconds 5 --crash-after-side-effect
-```
+- A step committed as `succeeded` is reused after restart.
+- A step whose worker disappeared is re-executed after its lease expires.
+- Only the current unexpired lease owner may commit a result.
+- Retried external effects are safe only when their integration supports a stable
+  idempotency key or equivalent reconciliation.
 
-After the lease expires, run a normal worker. It re-executes `publish`, receives
-the original publication ID, and completes without creating a duplicate.
-
-## Durable artifacts
-
-`write_report` saves `report.md` beneath `.runner/artifacts/<run-id>/` and returns
-an artifact reference. SQLite stores its path, SHA-256 checksum, byte size, media
-type, and producing step.
-
-```bash
-uv run runner artifacts <run-id>
-```
-
-Before publishing, the report is checked against its metadata. Because this demo's
-report is deterministic, a missing or corrupt file is regenerated from the earlier
-persisted step outputs and recorded with an `artifact_repaired` event.
-
-## Cancellation and budgets
-
-Cancel a run before more work is claimed:
-
-```bash
-uv run runner cancel <run-id> --reason "no longer needed"
-```
-
-Optional run-level budgets are reserved atomically before each step attempt:
-
-```bash
-uv run runner start demo --max-attempts 6 --max-steps 4 \
-  --max-tokens 200 --max-tool-calls 2 --max-cost-micros 3000
-```
-
-`inspect` shows accumulated usage and terminal reasons. Exceeding any limit fails
-the run before executing the step that would cross it.
-
-## Chaos recovery
-
-Run a deterministic campaign that kills fresh workers after claim, before commit,
-after commit, and after the publish side effect:
+The quickest end-to-end verification is:
 
 ```bash
 uv run runner chaos
 ```
 
-The campaign advances expired leases, restarts with new workers, prints the durable
-event timeline, and verifies that every step succeeds with exactly one publication.
+It crashes workers after claim, before commit, after commit, and after publication,
+then verifies that the run completes and exactly one publication exists.
+
+## Project status
+
+The implementation is complete for its teaching scope. It uses SQLite and local
+files, executes linear workflows, and starts workers manually. See
+[Known limitations](docs/FAILURE_SEMANTICS.md#known-limitations) before adapting it
+to real workloads.
