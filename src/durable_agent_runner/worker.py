@@ -2,14 +2,16 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from threading import Event, Thread
 from uuid import uuid4
 
+from durable_agent_runner.errors import RetryableStepError
 from durable_agent_runner.runner import EventObserver, RunnerEvent, SimulatedCrash, Workflow
 from durable_agent_runner.storage import ClaimedStep, SQLiteStore
 
 WorkflowResolver = Callable[[str], Workflow]
+Clock = Callable[[], datetime]
 
 
 @dataclass(frozen=True)
@@ -17,6 +19,8 @@ class WorkResult:
     run_id: str
     step_name: str
     run_completed: bool
+    status: str
+    attempt_count: int
 
 
 class LeaseHeartbeat:
@@ -68,11 +72,13 @@ class Worker:
         *,
         worker_id: str | None = None,
         observer: EventObserver | None = None,
+        clock: Clock | None = None,
     ) -> None:
         self._store = store
         self._resolve_workflow = resolve_workflow
         self.worker_id = worker_id or f"worker-{uuid4()}"
         self._observer = observer or (lambda _event: None)
+        self._clock = clock or (lambda: datetime.now(UTC))
 
     def run_once(
         self,
@@ -86,6 +92,7 @@ class Worker:
             self.worker_id,
             lease_duration=lease_duration,
             run_id=run_id,
+            now=self._clock(),
         )
         if claim is None:
             return None
@@ -104,13 +111,41 @@ class Worker:
         }
 
         self._observer(RunnerEvent("claimed", step.name))
-        with LeaseHeartbeat(self._store, claim, lease_duration):
-            output = step.execute(outputs)
+        try:
+            with LeaseHeartbeat(self._store, claim, lease_duration):
+                output = step.execute(outputs)
+        except Exception as error:
+            now = self._clock()
+            policy = step.retry_policy
+            retry_at = now + timedelta(
+                seconds=policy.delay_after(claim.attempt_count)
+            )
+            status = self._store.fail_claim(
+                claim,
+                error,
+                retryable=isinstance(error, RetryableStepError),
+                max_attempts=policy.max_attempts,
+                retry_at=retry_at,
+                now=now,
+            )
+            self._observer(RunnerEvent(status, step.name))
+            return WorkResult(
+                claim.run_id,
+                step.name,
+                run_completed=False,
+                status=status,
+                attempt_count=claim.attempt_count,
+            )
         if step.name == crash_before_commit:
             self._observer(RunnerEvent("crashed", step.name))
             raise SimulatedCrash(step.name)
 
-        run_completed = self._store.complete_claim(claim, output)
+        run_completed = self._store.complete_claim(claim, output, now=self._clock())
         self._observer(RunnerEvent("completed", step.name))
-        return WorkResult(claim.run_id, step.name, run_completed)
-
+        return WorkResult(
+            claim.run_id,
+            step.name,
+            run_completed,
+            status="succeeded",
+            attempt_count=claim.attempt_count,
+        )

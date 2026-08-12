@@ -54,3 +54,21 @@ uv run runner events <run-id>
 Every claim has an owner and expiration time. A second worker cannot execute the
 same step while its lease remains valid. Long-running workers heartbeat to extend
 their leases, while work held by a dead worker becomes claimable after expiration.
+
+## Durable retries
+
+Steps default to three attempts with exponential backoff. A retryable failure is
+persisted as `waiting_retry`; workers cannot claim it until `next_attempt_at`.
+
+```bash
+uv run runner worker --once --run-id <run-id> --retryable-failure plan
+uv run runner inspect <run-id>
+# Wait for the displayed next-attempt time, then omit failure injection:
+uv run runner worker --once --run-id <run-id>
+```
+
+A terminal failure skips retry and fails the entire run:
+
+```bash
+uv run runner worker --once --run-id <run-id> --terminal-failure plan
+```

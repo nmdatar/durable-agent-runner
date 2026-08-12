@@ -62,6 +62,9 @@ def build_parser() -> argparse.ArgumentParser:
     worker.add_argument("--worker-id", help="stable identity to record with the lease")
     worker.add_argument("--lease-seconds", type=int, default=30)
     worker.add_argument("--crash-before-commit", choices=STEP_NAMES)
+    failure = worker.add_mutually_exclusive_group()
+    failure.add_argument("--retryable-failure", choices=STEP_NAMES)
+    failure.add_argument("--terminal-failure", choices=STEP_NAMES)
     add_database_argument(worker)
     return parser
 
@@ -76,10 +79,18 @@ def open_store(path: Path) -> SQLiteStore:
     return store
 
 
-def resolve_demo_workflow(workflow_name: str):
+def resolve_demo_workflow(
+    workflow_name: str,
+    *,
+    failure_step: str | None = None,
+    failure_kind: str | None = None,
+):
     if workflow_name != "demo-research":
         raise ValueError(f"unknown workflow: {workflow_name}")
-    return build_demo_workflow("Why durability matters", DemoServices())
+    return build_demo_workflow(
+        "Why durability matters",
+        DemoServices(failure_step=failure_step, failure_kind=failure_kind),
+    )
 
 
 def run_durable(
@@ -144,7 +155,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         run = store.get_run(args.run_id)
         print(f"RUN {run.id} {run.workflow_name} {run.status}")
         for step in store.get_steps(args.run_id):
-            print(f"{step.position:02} {step.status:9} {step.name}")
+            retry = f" next={step.next_attempt_at}" if step.next_attempt_at else ""
+            error = f" error={step.last_error}" if step.last_error else ""
+            print(
+                f"{step.position:02} {step.status:13} {step.name} "
+                f"attempts={step.attempt_count}{retry}{error}"
+            )
         return 0
 
     if args.command == "events":
@@ -159,9 +175,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise SystemExit("worker currently requires --once")
         store = open_store(args.db)
         worker_id = args.worker_id or f"worker-{uuid4()}"
+        failure_step = args.retryable_failure or args.terminal_failure
+        failure_kind = "retryable" if args.retryable_failure else "terminal"
         worker = Worker(
             store,
-            resolve_demo_workflow,
+            lambda workflow_name: resolve_demo_workflow(
+                workflow_name,
+                failure_step=failure_step,
+                failure_kind=failure_kind if failure_step else None,
+            ),
             worker_id=worker_id,
             observer=print_event,
         )
@@ -178,7 +200,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             print("NO_WORK")
             return 0
         state = "RUN_COMPLETED" if work.run_completed else "STEP_COMPLETED"
-        print(f"{state} {work.run_id} {work.step_name} worker={worker_id}")
+        if work.status == "waiting_retry":
+            state = "RETRY_SCHEDULED"
+        elif work.status == "failed":
+            state = "RUN_FAILED"
+        print(
+            f"{state} {work.run_id} {work.step_name} "
+            f"worker={worker_id} attempt={work.attempt_count}"
+        )
         return 0
 
     raise AssertionError(f"unhandled command: {args.command}")

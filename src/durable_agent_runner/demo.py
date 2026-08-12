@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from durable_agent_runner.errors import RetryableStepError, TerminalStepError
 from durable_agent_runner.runner import Step, Workflow
 
 
@@ -12,11 +13,23 @@ class DemoServices:
     """Predictable stand-ins for a model, search tool, and external publisher."""
 
     publications: list[str] = field(default_factory=list)
+    failure_step: str | None = None
+    failure_kind: str | None = None
+
+    def _maybe_fail(self, step_name: str) -> None:
+        if self.failure_step != step_name:
+            return
+        if self.failure_kind == "retryable":
+            raise RetryableStepError(f"temporary failure in {step_name}")
+        if self.failure_kind == "terminal":
+            raise TerminalStepError(f"permanent failure in {step_name}")
 
     def plan(self, task: str) -> list[str]:
+        self._maybe_fail("plan")
         return ["durability", "idempotency"]
 
     def collect(self, topics: list[str]) -> list[str]:
+        self._maybe_fail("collect")
         facts = {
             "durability": "Durable progress survives process failure.",
             "idempotency": "An idempotent operation can be safely repeated.",
@@ -24,6 +37,7 @@ class DemoServices:
         return [facts[topic] for topic in topics]
 
     def publish(self, report: str) -> str:
+        self._maybe_fail("publish")
         publication_id = f"publication-{len(self.publications) + 1}"
         self.publications.append(report)
         return publication_id
@@ -39,6 +53,7 @@ def build_demo_workflow(task: str, services: DemoServices) -> Workflow:
         return services.collect(outputs["plan"])
 
     def write_report(outputs: Mapping[str, Any]) -> str:
+        services._maybe_fail("write_report")
         return f"# {task}\n\n" + "\n".join(outputs["collect"])
 
     def publish(outputs: Mapping[str, Any]) -> str:
@@ -53,4 +68,3 @@ def build_demo_workflow(task: str, services: DemoServices) -> Workflow:
             Step("publish", publish),
         ),
     )
-

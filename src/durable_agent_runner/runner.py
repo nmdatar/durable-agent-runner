@@ -1,11 +1,24 @@
 """The intentionally non-durable runner used as our baseline."""
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 StepAction = Callable[[Mapping[str, Any]], Any]
 EventObserver = Callable[["RunnerEvent"], None]
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    """Bounded exponential-backoff settings for one step."""
+
+    max_attempts: int = 3
+    initial_delay_seconds: float = 1.0
+    max_delay_seconds: float = 30.0
+
+    def delay_after(self, attempt_count: int) -> float:
+        delay = self.initial_delay_seconds * (2 ** (attempt_count - 1))
+        return min(delay, self.max_delay_seconds)
 
 
 @dataclass(frozen=True)
@@ -14,6 +27,7 @@ class Step:
 
     name: str
     execute: StepAction
+    retry_policy: RetryPolicy = field(default_factory=RetryPolicy)
 
 
 @dataclass(frozen=True)
@@ -79,4 +93,3 @@ class InMemoryRunner:
                 raise SimulatedCrash(step.name)
 
         return RunResult(workflow.name, dict(self._outputs))
-

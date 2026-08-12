@@ -27,6 +27,9 @@ class StepSnapshot:
     position: int
     status: str
     output: Any | None
+    attempt_count: int
+    next_attempt_at: str | None
+    last_error: str | None
 
 
 @dataclass(frozen=True)
@@ -45,6 +48,7 @@ class ClaimedStep:
     step_name: str
     worker_id: str
     lease_expires_at: str
+    attempt_count: int
 
 
 class SQLiteStore:
@@ -87,6 +91,9 @@ class SQLiteStore:
                     completed_at TEXT,
                     lease_owner TEXT,
                     lease_expires_at TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at TEXT,
+                    last_error TEXT,
                     PRIMARY KEY (run_id, name),
                     UNIQUE (run_id, position)
                 );
@@ -109,8 +116,16 @@ class SQLiteStore:
                 connection.execute("ALTER TABLE steps ADD COLUMN lease_owner TEXT")
             if "lease_expires_at" not in columns:
                 connection.execute("ALTER TABLE steps ADD COLUMN lease_expires_at TEXT")
+            if "attempt_count" not in columns:
+                connection.execute(
+                    "ALTER TABLE steps ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0"
+                )
+            if "next_attempt_at" not in columns:
+                connection.execute("ALTER TABLE steps ADD COLUMN next_attempt_at TEXT")
+            if "last_error" not in columns:
+                connection.execute("ALTER TABLE steps ADD COLUMN last_error TEXT")
             connection.execute("DELETE FROM schema_version")
-            connection.execute("INSERT INTO schema_version(version) VALUES (2)")
+            connection.execute("INSERT INTO schema_version(version) VALUES (3)")
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_steps_claimable
@@ -156,7 +171,8 @@ class SQLiteStore:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT name, position, status, output_json
+                SELECT name, position, status, output_json,
+                       attempt_count, next_attempt_at, last_error
                 FROM steps
                 WHERE run_id = ?
                 ORDER BY position
@@ -171,6 +187,9 @@ class SQLiteStore:
                 output=json.loads(row["output_json"])
                 if row["output_json"] is not None
                 else None,
+                attempt_count=row["attempt_count"],
+                next_attempt_at=row["next_attempt_at"],
+                last_error=row["last_error"],
             )
             for row in rows
         ]
@@ -225,6 +244,7 @@ class SQLiteStore:
                     s.name,
                     s.status,
                     s.lease_owner,
+                    s.attempt_count,
                     r.workflow_name,
                     r.status AS run_status
                 FROM steps AS s
@@ -232,6 +252,10 @@ class SQLiteStore:
                 WHERE r.status IN ('pending', 'running')
                   AND (
                       s.status = 'pending'
+                      OR (
+                          s.status = 'waiting_retry'
+                          AND s.next_attempt_at <= ?
+                      )
                       OR (
                           s.status = 'running'
                           AND s.lease_expires_at <= ?
@@ -248,7 +272,7 @@ class SQLiteStore:
                 ORDER BY r.created_at, s.position
                 LIMIT 1
                 """,
-                (claimed_at_text, run_id, run_id),
+                (claimed_at_text, claimed_at_text, run_id, run_id),
             ).fetchone()
             if row is None:
                 connection.commit()
@@ -270,7 +294,9 @@ class SQLiteStore:
                 SET status = 'running',
                     started_at = ?,
                     lease_owner = ?,
-                    lease_expires_at = ?
+                    lease_expires_at = ?,
+                    attempt_count = attempt_count + 1,
+                    next_attempt_at = NULL
                 WHERE run_id = ? AND name = ?
                 """,
                 (
@@ -296,6 +322,7 @@ class SQLiteStore:
                     "worker_id": worker_id,
                     "lease_expires_at": expires_at,
                     "reclaimed": reclaimed,
+                    "attempt_count": row["attempt_count"] + 1,
                 },
             )
             connection.commit()
@@ -305,6 +332,7 @@ class SQLiteStore:
                 step_name=row["name"],
                 worker_id=worker_id,
                 lease_expires_at=expires_at,
+                attempt_count=row["attempt_count"] + 1,
             )
         except Exception:
             connection.rollback()
@@ -360,7 +388,79 @@ class SQLiteStore:
             step_name=claim.step_name,
             worker_id=claim.worker_id,
             lease_expires_at=expires_at,
+            attempt_count=claim.attempt_count,
         )
+
+    def fail_claim(
+        self,
+        claim: ClaimedStep,
+        error: Exception,
+        *,
+        retryable: bool,
+        max_attempts: int,
+        retry_at: datetime | None,
+        now: datetime | None = None,
+    ) -> str:
+        """Persist a failed attempt and either schedule retry or fail the run."""
+        failed_at = now or datetime.now(UTC)
+        failed_at_text = failed_at.isoformat()
+        will_retry = retryable and claim.attempt_count < max_attempts
+        status = "waiting_retry" if will_retry else "failed"
+        next_attempt_at = retry_at.isoformat() if will_retry and retry_at else None
+        error_text = f"{type(error).__name__}: {error}"
+
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE steps
+                SET status = ?,
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    next_attempt_at = ?,
+                    last_error = ?
+                WHERE run_id = ?
+                  AND name = ?
+                  AND status = 'running'
+                  AND lease_owner = ?
+                  AND lease_expires_at > ?
+                """,
+                (
+                    status,
+                    next_attempt_at,
+                    error_text,
+                    claim.run_id,
+                    claim.step_name,
+                    claim.worker_id,
+                    failed_at_text,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("cannot fail a lease that is expired or not owned")
+            event_type = "step_retry_scheduled" if will_retry else "step_failed"
+            self._insert_event(
+                connection,
+                claim.run_id,
+                event_type,
+                step_name=claim.step_name,
+                payload={
+                    "worker_id": claim.worker_id,
+                    "attempt_count": claim.attempt_count,
+                    "error": error_text,
+                    "next_attempt_at": next_attempt_at,
+                },
+            )
+            if not will_retry:
+                connection.execute(
+                    "UPDATE runs SET status = 'failed', updated_at = ? WHERE id = ?",
+                    (failed_at_text, claim.run_id),
+                )
+                self._insert_event(
+                    connection,
+                    claim.run_id,
+                    "run_failed",
+                    payload={"step_name": claim.step_name, "error": error_text},
+                )
+        return status
 
     def complete_claim(
         self,
