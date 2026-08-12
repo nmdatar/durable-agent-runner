@@ -104,6 +104,22 @@ class Worker:
             [step.name for step in workflow.steps],
         )
         step = next(step for step in workflow.steps if step.name == claim.step_name)
+        budget_error = self._store.reserve_budget(
+            claim,
+            tokens=step.usage.tokens,
+            tool_calls=step.usage.tool_calls,
+            cost_micros=step.usage.cost_micros,
+            now=self._clock(),
+        )
+        if budget_error is not None:
+            self._observer(RunnerEvent("budget_exceeded", step.name))
+            return WorkResult(
+                claim.run_id,
+                step.name,
+                run_completed=False,
+                status="failed",
+                attempt_count=claim.attempt_count,
+            )
         outputs = {
             stored.name: stored.output
             for stored in self._store.get_steps(claim.run_id)

@@ -103,3 +103,21 @@ uv run runner artifacts <run-id>
 Before publishing, the report is checked against its metadata. Because this demo's
 report is deterministic, a missing or corrupt file is regenerated from the earlier
 persisted step outputs and recorded with an `artifact_repaired` event.
+
+## Cancellation and budgets
+
+Cancel a run before more work is claimed:
+
+```bash
+uv run runner cancel <run-id> --reason "no longer needed"
+```
+
+Optional run-level budgets are reserved atomically before each step attempt:
+
+```bash
+uv run runner start demo --max-attempts 6 --max-steps 4 \
+  --max-tokens 200 --max-tool-calls 2 --max-cost-micros 3000
+```
+
+`inspect` shows accumulated usage and terminal reasons. Exceeding any limit fails
+the run before executing the step that would cross it.

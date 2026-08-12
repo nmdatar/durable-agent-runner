@@ -7,7 +7,7 @@ from typing import Any
 from durable_agent_runner.artifacts import ArtifactIntegrityError, ArtifactManager
 from durable_agent_runner.errors import RetryableStepError, TerminalStepError
 from durable_agent_runner.operations import IdempotentPublisher
-from durable_agent_runner.runner import Step, Workflow
+from durable_agent_runner.runner import Step, StepUsage, Workflow
 
 
 @dataclass
@@ -98,9 +98,9 @@ def build_demo_workflow(task: str, services: DemoServices) -> Workflow:
     return Workflow(
         name="demo-research",
         steps=(
-            Step("plan", plan),
-            Step("collect", collect),
-            Step("write_report", write_report),
-            Step("publish", publish),
+            Step("plan", plan, usage=StepUsage(tokens=100, cost_micros=1_000)),
+            Step("collect", collect, usage=StepUsage(tool_calls=1, cost_micros=500)),
+            Step("write_report", write_report, usage=StepUsage(tokens=50, cost_micros=500)),
+            Step("publish", publish, usage=StepUsage(tool_calls=1, cost_micros=250)),
         ),
     )

@@ -8,7 +8,7 @@ from durable_agent_runner.runner import (
     SimulatedCrash,
     Workflow,
 )
-from durable_agent_runner.storage import SQLiteStore
+from durable_agent_runner.storage import RunBudget, SQLiteStore
 from durable_agent_runner.worker import Worker
 
 
@@ -25,10 +25,15 @@ class DurableRunner:
         self._observer = observer or (lambda _event: None)
         self._worker_id = worker_id or f"local-runner-{uuid4()}"
 
-    def create_run(self, workflow: Workflow) -> str:
+    def create_run(
+        self,
+        workflow: Workflow,
+        budget: RunBudget | None = None,
+    ) -> str:
         return self._store.create_run(
             workflow.name,
             [step.name for step in workflow.steps],
+            budget,
         )
 
     def run(

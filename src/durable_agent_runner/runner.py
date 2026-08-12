@@ -22,12 +22,22 @@ class RetryPolicy:
 
 
 @dataclass(frozen=True)
+class StepUsage:
+    """Estimated resources reserved before executing one step attempt."""
+
+    tokens: int = 0
+    tool_calls: int = 0
+    cost_micros: int = 0
+
+
+@dataclass(frozen=True)
 class Step:
     """One named unit of work in a workflow."""
 
     name: str
     execute: StepAction
     retry_policy: RetryPolicy = field(default_factory=RetryPolicy)
+    usage: StepUsage = field(default_factory=StepUsage)
 
 
 @dataclass(frozen=True)

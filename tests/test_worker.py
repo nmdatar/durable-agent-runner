@@ -24,7 +24,7 @@ def test_database_initialization_is_safe_to_repeat(tmp_path) -> None:
         versions = connection.execute(
             "SELECT version FROM schema_version"
         ).fetchall()
-    assert versions == [(5,)]
+    assert versions == [(6,)]
 
 
 def test_second_worker_cannot_claim_a_step_with_a_live_lease(tmp_path) -> None:

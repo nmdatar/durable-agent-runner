@@ -11,7 +11,7 @@ from durable_agent_runner.demo import DemoServices, build_demo_workflow
 from durable_agent_runner.durable_runner import DurableRunner
 from durable_agent_runner.operations import IdempotentPublisher
 from durable_agent_runner.runner import InMemoryRunner, RunnerEvent, SimulatedCrash
-from durable_agent_runner.storage import SQLiteStore
+from durable_agent_runner.storage import RunBudget, SQLiteStore
 from durable_agent_runner.worker import Worker
 
 STEP_NAMES = ("plan", "collect", "write_report", "publish")
@@ -43,7 +43,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     start = subparsers.add_parser("start", help="enqueue a durable run")
     start.add_argument("workflow", choices=("demo",))
+    start.add_argument("--max-attempts", type=int)
+    start.add_argument("--max-steps", type=int)
+    start.add_argument("--max-tokens", type=int)
+    start.add_argument("--max-tool-calls", type=int)
+    start.add_argument("--max-cost-micros", type=int)
     add_database_argument(start)
+
+    cancel = subparsers.add_parser("cancel", help="cancel a pending or running run")
+    cancel.add_argument("run_id")
+    cancel.add_argument("--reason", default="cancelled by user")
+    add_database_argument(cancel)
 
     resume = subparsers.add_parser("resume", help="resume a durable run")
     resume.add_argument("run_id")
@@ -167,10 +177,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "start":
         store = open_store(args.db)
         workflow = build_demo_workflow("Why durability matters", DemoServices())
-        run_id = DurableRunner(store).create_run(workflow)
+        run_id = DurableRunner(store).create_run(
+            workflow,
+            RunBudget(
+                max_attempts=args.max_attempts,
+                max_steps=args.max_steps,
+                max_tokens=args.max_tokens,
+                max_tool_calls=args.max_tool_calls,
+                max_cost_micros=args.max_cost_micros,
+            ),
+        )
         print(f"RUN_ID {run_id}")
         print(f"QUEUED  {workflow.name}")
         print(f"Run one step with: runner worker --once --run-id {run_id}")
+        return 0
+
+    if args.command == "cancel":
+        store = open_store(args.db)
+        changed = store.cancel_run(args.run_id, args.reason)
+        print("CANCELLED" if changed else "UNCHANGED")
         return 0
 
     if args.command == "resume":
@@ -181,6 +206,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         store = open_store(args.db)
         run = store.get_run(args.run_id)
         print(f"RUN {run.id} {run.workflow_name} {run.status}")
+        if run.terminal_reason:
+            print(f"REASON {run.terminal_reason}")
+        print(
+            "USAGE "
+            f"attempts={run.used_attempts} steps={run.used_steps} "
+            f"tokens={run.used_tokens} tool_calls={run.used_tool_calls} "
+            f"cost_micros={run.used_cost_micros}"
+        )
         for step in store.get_steps(args.run_id):
             retry = f" next={step.next_attempt_at}" if step.next_attempt_at else ""
             error = f" error={step.last_error}" if step.last_error else ""

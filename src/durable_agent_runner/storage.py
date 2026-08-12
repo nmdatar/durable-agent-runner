@@ -19,6 +19,21 @@ class RunSnapshot:
     id: str
     workflow_name: str
     status: str
+    terminal_reason: str | None
+    used_attempts: int
+    used_steps: int
+    used_tokens: int
+    used_tool_calls: int
+    used_cost_micros: int
+
+
+@dataclass(frozen=True)
+class RunBudget:
+    max_attempts: int | None = None
+    max_steps: int | None = None
+    max_tokens: int | None = None
+    max_tool_calls: int | None = None
+    max_cost_micros: int | None = None
 
 
 @dataclass(frozen=True)
@@ -97,7 +112,18 @@ class SQLiteStore:
                     workflow_name TEXT NOT NULL,
                     status TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    terminal_reason TEXT,
+                    max_attempts INTEGER,
+                    max_steps INTEGER,
+                    max_tokens INTEGER,
+                    max_tool_calls INTEGER,
+                    max_cost_micros INTEGER,
+                    used_attempts INTEGER NOT NULL DEFAULT 0,
+                    used_steps INTEGER NOT NULL DEFAULT 0,
+                    used_tokens INTEGER NOT NULL DEFAULT 0,
+                    used_tool_calls INTEGER NOT NULL DEFAULT 0,
+                    used_cost_micros INTEGER NOT NULL DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS steps (
@@ -175,8 +201,30 @@ class SQLiteStore:
                 connection.execute("ALTER TABLE steps ADD COLUMN next_attempt_at TEXT")
             if "last_error" not in columns:
                 connection.execute("ALTER TABLE steps ADD COLUMN last_error TEXT")
+            run_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(runs)").fetchall()
+            }
+            run_migrations = {
+                "terminal_reason": "TEXT",
+                "max_attempts": "INTEGER",
+                "max_steps": "INTEGER",
+                "max_tokens": "INTEGER",
+                "max_tool_calls": "INTEGER",
+                "max_cost_micros": "INTEGER",
+                "used_attempts": "INTEGER NOT NULL DEFAULT 0",
+                "used_steps": "INTEGER NOT NULL DEFAULT 0",
+                "used_tokens": "INTEGER NOT NULL DEFAULT 0",
+                "used_tool_calls": "INTEGER NOT NULL DEFAULT 0",
+                "used_cost_micros": "INTEGER NOT NULL DEFAULT 0",
+            }
+            for column, definition in run_migrations.items():
+                if column not in run_columns:
+                    connection.execute(
+                        f"ALTER TABLE runs ADD COLUMN {column} {definition}"
+                    )
             connection.execute("DELETE FROM schema_version")
-            connection.execute("INSERT INTO schema_version(version) VALUES (5)")
+            connection.execute("INSERT INTO schema_version(version) VALUES (6)")
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_steps_claimable
@@ -184,16 +232,35 @@ class SQLiteStore:
                 """
             )
 
-    def create_run(self, workflow_name: str, step_names: Sequence[str]) -> str:
+    def create_run(
+        self,
+        workflow_name: str,
+        step_names: Sequence[str],
+        budget: RunBudget | None = None,
+    ) -> str:
         run_id = str(uuid4())
         now = utc_now()
+        budget = budget or RunBudget()
         with self._connect() as connection:
             connection.execute(
                 """
-                INSERT INTO runs(id, workflow_name, status, created_at, updated_at)
-                VALUES (?, ?, 'pending', ?, ?)
+                INSERT INTO runs(
+                    id, workflow_name, status, created_at, updated_at,
+                    max_attempts, max_steps, max_tokens,
+                    max_tool_calls, max_cost_micros
+                ) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (run_id, workflow_name, now, now),
+                (
+                    run_id,
+                    workflow_name,
+                    now,
+                    now,
+                    budget.max_attempts,
+                    budget.max_steps,
+                    budget.max_tokens,
+                    budget.max_tool_calls,
+                    budget.max_cost_micros,
+                ),
             )
             connection.executemany(
                 """
@@ -211,12 +278,27 @@ class SQLiteStore:
     def get_run(self, run_id: str) -> RunSnapshot:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT id, workflow_name, status FROM runs WHERE id = ?",
+                """
+                SELECT id, workflow_name, status, terminal_reason,
+                       used_attempts, used_steps, used_tokens,
+                       used_tool_calls, used_cost_micros
+                FROM runs WHERE id = ?
+                """,
                 (run_id,),
             ).fetchone()
         if row is None:
             raise KeyError(f"unknown run: {run_id}")
-        return RunSnapshot(row["id"], row["workflow_name"], row["status"])
+        return RunSnapshot(
+            id=row["id"],
+            workflow_name=row["workflow_name"],
+            status=row["status"],
+            terminal_reason=row["terminal_reason"],
+            used_attempts=row["used_attempts"],
+            used_steps=row["used_steps"],
+            used_tokens=row["used_tokens"],
+            used_tool_calls=row["used_tool_calls"],
+            used_cost_micros=row["used_cost_micros"],
+        )
 
     def get_steps(self, run_id: str) -> list[StepSnapshot]:
         with self._connect() as connection:
@@ -454,6 +536,126 @@ class SQLiteStore:
         if run.workflow_name != workflow_name or stored_names != list(step_names):
             raise ValueError("the supplied workflow does not match the stored run")
 
+    def cancel_run(self, run_id: str, reason: str = "cancelled by user") -> bool:
+        """Cancel a non-terminal run; already running work may finish its step."""
+        now = utc_now()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE runs
+                SET status = 'cancelled', terminal_reason = ?, updated_at = ?
+                WHERE id = ? AND status IN ('pending', 'running')
+                """,
+                (reason, now, run_id),
+            )
+            if cursor.rowcount:
+                self._insert_event(
+                    connection,
+                    run_id,
+                    "run_cancelled",
+                    payload={"reason": reason},
+                )
+        return cursor.rowcount == 1
+
+    def reserve_budget(
+        self,
+        claim: ClaimedStep,
+        *,
+        tokens: int,
+        tool_calls: int,
+        cost_micros: int,
+        now: datetime | None = None,
+    ) -> str | None:
+        """Atomically reserve one attempt's declared usage or fail the run."""
+        reserved_at = now or datetime.now(UTC)
+        reserved_at_text = reserved_at.isoformat()
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT status, max_attempts, max_steps, max_tokens,
+                       max_tool_calls, max_cost_micros,
+                       used_attempts, used_steps, used_tokens,
+                       used_tool_calls, used_cost_micros
+                FROM runs WHERE id = ?
+                """,
+                (claim.run_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"unknown run: {claim.run_id}")
+            if row["status"] not in ("pending", "running"):
+                return f"run is already {row['status']}"
+
+            additions = {
+                "attempts": 1,
+                "steps": 1 if claim.attempt_count == 1 else 0,
+                "tokens": tokens,
+                "tool_calls": tool_calls,
+                "cost_micros": cost_micros,
+            }
+            exceeded = None
+            for metric, amount in additions.items():
+                maximum = row[f"max_{metric}"]
+                if maximum is not None and row[f"used_{metric}"] + amount > maximum:
+                    exceeded = metric
+                    break
+
+            if exceeded is not None:
+                reason = f"budget exceeded: max_{exceeded}"
+                connection.execute(
+                    """
+                    UPDATE steps
+                    SET status = 'failed', lease_owner = NULL,
+                        lease_expires_at = NULL, last_error = ?
+                    WHERE run_id = ? AND name = ? AND lease_owner = ?
+                    """,
+                    (reason, claim.run_id, claim.step_name, claim.worker_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE runs
+                    SET status = 'failed', terminal_reason = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (reason, reserved_at_text, claim.run_id),
+                )
+                self._insert_event(
+                    connection,
+                    claim.run_id,
+                    "run_budget_exceeded",
+                    step_name=claim.step_name,
+                    payload={"metric": exceeded, "reason": reason},
+                )
+                return reason
+
+            connection.execute(
+                """
+                UPDATE runs
+                SET used_attempts = used_attempts + 1,
+                    used_steps = used_steps + ?,
+                    used_tokens = used_tokens + ?,
+                    used_tool_calls = used_tool_calls + ?,
+                    used_cost_micros = used_cost_micros + ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    additions["steps"],
+                    tokens,
+                    tool_calls,
+                    cost_micros,
+                    reserved_at_text,
+                    claim.run_id,
+                ),
+            )
+            self._insert_event(
+                connection,
+                claim.run_id,
+                "budget_reserved",
+                step_name=claim.step_name,
+                payload=additions,
+            )
+        return None
+
     def claim_next_step(
         self,
         worker_id: str,
@@ -683,8 +885,12 @@ class SQLiteStore:
             )
             if not will_retry:
                 connection.execute(
-                    "UPDATE runs SET status = 'failed', updated_at = ? WHERE id = ?",
-                    (failed_at_text, claim.run_id),
+                    """
+                    UPDATE runs
+                    SET status = 'failed', terminal_reason = ?, updated_at = ?
+                    WHERE id = ? AND status = 'running'
+                    """,
+                    (error_text, failed_at_text, claim.run_id),
                 )
                 self._insert_event(
                     connection,
@@ -745,7 +951,11 @@ class SQLiteStore:
                 """,
                 (claim.run_id,),
             ).fetchone()[0]
-            run_completed = unfinished == 0
+            run_status = connection.execute(
+                "SELECT status FROM runs WHERE id = ?",
+                (claim.run_id,),
+            ).fetchone()["status"]
+            run_completed = unfinished == 0 and run_status == "running"
             if run_completed:
                 connection.execute(
                     "UPDATE runs SET status = 'completed', updated_at = ? WHERE id = ?",
