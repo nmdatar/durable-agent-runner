@@ -58,6 +58,18 @@ class OperationSnapshot:
     result: Any | None
 
 
+@dataclass(frozen=True)
+class ArtifactSnapshot:
+    id: str
+    run_id: str
+    step_name: str
+    name: str
+    path: str
+    sha256: str
+    size_bytes: int
+    media_type: str
+
+
 class SQLiteStore:
     """Store current state and append-only events in the same database."""
 
@@ -131,6 +143,20 @@ class SQLiteStore:
                     report TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS artifacts (
+                    id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                    step_name TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL,
+                    media_type TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(run_id, step_name, name)
+                );
                 """
             )
             columns = {
@@ -150,7 +176,7 @@ class SQLiteStore:
             if "last_error" not in columns:
                 connection.execute("ALTER TABLE steps ADD COLUMN last_error TEXT")
             connection.execute("DELETE FROM schema_version")
-            connection.execute("INSERT INTO schema_version(version) VALUES (4)")
+            connection.execute("INSERT INTO schema_version(version) VALUES (5)")
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_steps_claimable
@@ -323,6 +349,104 @@ class SQLiteStore:
                 "SELECT COUNT(*) FROM publications WHERE idempotency_key = ?",
                 (idempotency_key,),
             ).fetchone()[0]
+
+    def save_artifact(
+        self,
+        *,
+        run_id: str,
+        step_name: str,
+        name: str,
+        path: str,
+        sha256: str,
+        size_bytes: int,
+        media_type: str,
+        repaired: bool = False,
+    ) -> ArtifactSnapshot:
+        """Insert or refresh metadata after artifact bytes are durable."""
+        now = utc_now()
+        with self._connect() as connection:
+            existing = connection.execute(
+                """
+                SELECT id FROM artifacts
+                WHERE run_id = ? AND step_name = ? AND name = ?
+                """,
+                (run_id, step_name, name),
+            ).fetchone()
+            artifact_id = existing["id"] if existing else str(uuid4())
+            connection.execute(
+                """
+                INSERT INTO artifacts(
+                    id, run_id, step_name, name, path, sha256,
+                    size_bytes, media_type, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id, step_name, name) DO UPDATE SET
+                    path = excluded.path,
+                    sha256 = excluded.sha256,
+                    size_bytes = excluded.size_bytes,
+                    media_type = excluded.media_type,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    artifact_id,
+                    run_id,
+                    step_name,
+                    name,
+                    path,
+                    sha256,
+                    size_bytes,
+                    media_type,
+                    now,
+                    now,
+                ),
+            )
+            self._insert_event(
+                connection,
+                run_id,
+                "artifact_repaired" if repaired else "artifact_saved",
+                step_name=step_name,
+                payload={
+                    "artifact_id": artifact_id,
+                    "name": name,
+                    "path": path,
+                    "sha256": sha256,
+                    "size_bytes": size_bytes,
+                },
+            )
+        return self.get_artifact(artifact_id)
+
+    def get_artifact(self, artifact_id: str) -> ArtifactSnapshot:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, run_id, step_name, name, path, sha256,
+                       size_bytes, media_type
+                FROM artifacts WHERE id = ?
+                """,
+                (artifact_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"unknown artifact: {artifact_id}")
+        return ArtifactSnapshot(
+            id=row["id"],
+            run_id=row["run_id"],
+            step_name=row["step_name"],
+            name=row["name"],
+            path=row["path"],
+            sha256=row["sha256"],
+            size_bytes=row["size_bytes"],
+            media_type=row["media_type"],
+        )
+
+    def list_artifacts(self, run_id: str) -> list[ArtifactSnapshot]:
+        with self._connect() as connection:
+            ids = [
+                row["id"]
+                for row in connection.execute(
+                    "SELECT id FROM artifacts WHERE run_id = ? ORDER BY created_at",
+                    (run_id,),
+                ).fetchall()
+            ]
+        return [self.get_artifact(artifact_id) for artifact_id in ids]
 
     def validate_workflow(self, run_id: str, workflow_name: str, step_names: Sequence[str]) -> None:
         run = self.get_run(run_id)

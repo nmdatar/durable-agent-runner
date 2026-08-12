@@ -89,3 +89,17 @@ uv run runner worker --once --run-id <run-id> \
 
 After the lease expires, run a normal worker. It re-executes `publish`, receives
 the original publication ID, and completes without creating a duplicate.
+
+## Durable artifacts
+
+`write_report` saves `report.md` beneath `.runner/artifacts/<run-id>/` and returns
+an artifact reference. SQLite stores its path, SHA-256 checksum, byte size, media
+type, and producing step.
+
+```bash
+uv run runner artifacts <run-id>
+```
+
+Before publishing, the report is checked against its metadata. Because this demo's
+report is deterministic, a missing or corrupt file is regenerated from the earlier
+persisted step outputs and recorded with an `artifact_repaired` event.

@@ -6,6 +6,7 @@ from datetime import timedelta
 from pathlib import Path
 from uuid import uuid4
 
+from durable_agent_runner.artifacts import ArtifactManager
 from durable_agent_runner.demo import DemoServices, build_demo_workflow
 from durable_agent_runner.durable_runner import DurableRunner
 from durable_agent_runner.operations import IdempotentPublisher
@@ -57,6 +58,10 @@ def build_parser() -> argparse.ArgumentParser:
     events.add_argument("run_id")
     add_database_argument(events)
 
+    artifacts = subparsers.add_parser("artifacts", help="show durable run artifacts")
+    artifacts.add_argument("run_id")
+    add_database_argument(artifacts)
+
     worker = subparsers.add_parser("worker", help="claim and execute queued work")
     worker.add_argument("--once", action="store_true", help="execute at most one step")
     worker.add_argument("--run-id", help="only claim work from this run")
@@ -105,6 +110,8 @@ def resolve_demo_workflow(
                 claim.run_id,
                 crash_after_effect=crash_after_effect,
             ),
+            artifacts=ArtifactManager(store, store.path.parent / "artifacts"),
+            run_id=claim.run_id,
         ),
     )
 
@@ -115,7 +122,11 @@ def run_durable(
     *,
     crash_after: str | None,
 ) -> int:
-    services = DemoServices(publisher=IdempotentPublisher(store, run_id))
+    services = DemoServices(
+        publisher=IdempotentPublisher(store, run_id),
+        artifacts=ArtifactManager(store, store.path.parent / "artifacts"),
+        run_id=run_id,
+    )
     workflow = build_demo_workflow("Why durability matters", services)
     runner = DurableRunner(store, observer=print_event)
     try:
@@ -184,6 +195,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         for event in store.get_events(args.run_id):
             step = f" {event.step_name}" if event.step_name else ""
             print(f"{event.id:04} {event.event_type}{step}")
+        return 0
+
+    if args.command == "artifacts":
+        store = open_store(args.db)
+        manager = ArtifactManager(store, store.path.parent / "artifacts")
+        for artifact in store.list_artifacts(args.run_id):
+            print(
+                f"{artifact.id} {artifact.name} {artifact.media_type} "
+                f"{artifact.size_bytes}B sha256={artifact.sha256} "
+                f"path={manager.path_for(artifact)}"
+            )
         return 0
 
     if args.command == "worker":
