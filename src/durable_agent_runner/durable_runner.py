@@ -1,13 +1,15 @@
-"""A runner that resumes from step boundaries stored in SQLite."""
+"""Convenience facade for creating and locally draining durable runs."""
+
+from uuid import uuid4
 
 from durable_agent_runner.runner import (
     EventObserver,
     RunResult,
-    RunnerEvent,
     SimulatedCrash,
     Workflow,
 )
 from durable_agent_runner.storage import SQLiteStore
+from durable_agent_runner.worker import Worker
 
 
 class DurableRunner:
@@ -17,9 +19,11 @@ class DurableRunner:
         self,
         store: SQLiteStore,
         observer: EventObserver | None = None,
+        worker_id: str | None = None,
     ) -> None:
         self._store = store
         self._observer = observer or (lambda _event: None)
+        self._worker_id = worker_id or f"local-runner-{uuid4()}"
 
     def create_run(self, workflow: Workflow) -> str:
         return self._store.create_run(
@@ -34,34 +38,32 @@ class DurableRunner:
         *,
         crash_after: str | None = None,
     ) -> RunResult:
-        """Resume a stored run and execute only unfinished steps."""
+        """Drain one run locally while still obeying worker leases."""
         step_names = [step.name for step in workflow.steps]
         self._store.validate_workflow(run_id, workflow.name, step_names)
-        self._store.begin_or_resume_run(run_id)
 
-        stored_steps = self._store.get_steps(run_id)
+        def resolve_workflow(stored_name: str) -> Workflow:
+            if stored_name != workflow.name:
+                raise ValueError(f"unknown workflow: {stored_name}")
+            return workflow
+
+        worker = Worker(
+            self._store,
+            resolve_workflow,
+            worker_id=self._worker_id,
+            observer=self._observer,
+        )
+
+        while self._store.get_run(run_id).status != "completed":
+            work = worker.run_once(run_id=run_id)
+            if work is None:
+                raise RuntimeError("run has work, but no step is currently claimable")
+            if work.step_name == crash_after:
+                raise SimulatedCrash(work.step_name)
+
         outputs = {
             step.name: step.output
-            for step in stored_steps
+            for step in self._store.get_steps(run_id)
             if step.status == "succeeded"
         }
-
-        for step in workflow.steps:
-            if step.name in outputs:
-                self._observer(RunnerEvent("skipped", step.name))
-                continue
-
-            self._store.start_step(run_id, step.name)
-            self._observer(RunnerEvent("started", step.name))
-            output = step.execute(outputs)
-            self._store.complete_step(run_id, step.name, output)
-            outputs[step.name] = output
-            self._observer(RunnerEvent("completed", step.name))
-
-            if step.name == crash_after:
-                self._observer(RunnerEvent("crashed", step.name))
-                raise SimulatedCrash(step.name)
-
-        self._store.complete_run(run_id)
         return RunResult(workflow.name, outputs)
-

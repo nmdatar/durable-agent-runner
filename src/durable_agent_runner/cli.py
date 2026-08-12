@@ -2,12 +2,15 @@
 
 import argparse
 from collections.abc import Sequence
+from datetime import timedelta
 from pathlib import Path
+from uuid import uuid4
 
 from durable_agent_runner.demo import DemoServices, build_demo_workflow
 from durable_agent_runner.durable_runner import DurableRunner
 from durable_agent_runner.runner import InMemoryRunner, RunnerEvent, SimulatedCrash
 from durable_agent_runner.storage import SQLiteStore
+from durable_agent_runner.worker import Worker
 
 STEP_NAMES = ("plan", "collect", "write_report", "publish")
 DEFAULT_DB = Path(".runner/runner.db")
@@ -36,9 +39,8 @@ def build_parser() -> argparse.ArgumentParser:
     init = subparsers.add_parser("init", help="initialize the SQLite database")
     add_database_argument(init)
 
-    start = subparsers.add_parser("start", help="create and execute a durable run")
+    start = subparsers.add_parser("start", help="enqueue a durable run")
     start.add_argument("workflow", choices=("demo",))
-    start.add_argument("--crash-after", choices=STEP_NAMES)
     add_database_argument(start)
 
     resume = subparsers.add_parser("resume", help="resume a durable run")
@@ -53,6 +55,14 @@ def build_parser() -> argparse.ArgumentParser:
     events = subparsers.add_parser("events", help="show durable event history")
     events.add_argument("run_id")
     add_database_argument(events)
+
+    worker = subparsers.add_parser("worker", help="claim and execute queued work")
+    worker.add_argument("--once", action="store_true", help="execute at most one step")
+    worker.add_argument("--run-id", help="only claim work from this run")
+    worker.add_argument("--worker-id", help="stable identity to record with the lease")
+    worker.add_argument("--lease-seconds", type=int, default=30)
+    worker.add_argument("--crash-before-commit", choices=STEP_NAMES)
+    add_database_argument(worker)
     return parser
 
 
@@ -64,6 +74,12 @@ def open_store(path: Path) -> SQLiteStore:
     store = SQLiteStore(path)
     store.initialize()
     return store
+
+
+def resolve_demo_workflow(workflow_name: str):
+    if workflow_name != "demo-research":
+        raise ValueError(f"unknown workflow: {workflow_name}")
+    return build_demo_workflow("Why durability matters", DemoServices())
 
 
 def run_durable(
@@ -115,7 +131,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         workflow = build_demo_workflow("Why durability matters", DemoServices())
         run_id = DurableRunner(store).create_run(workflow)
         print(f"RUN_ID {run_id}")
-        return run_durable(store, run_id, crash_after=args.crash_after)
+        print(f"QUEUED  {workflow.name}")
+        print(f"Run one step with: runner worker --once --run-id {run_id}")
+        return 0
 
     if args.command == "resume":
         store = open_store(args.db)
@@ -134,6 +152,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         for event in store.get_events(args.run_id):
             step = f" {event.step_name}" if event.step_name else ""
             print(f"{event.id:04} {event.event_type}{step}")
+        return 0
+
+    if args.command == "worker":
+        if not args.once:
+            raise SystemExit("worker currently requires --once")
+        store = open_store(args.db)
+        worker_id = args.worker_id or f"worker-{uuid4()}"
+        worker = Worker(
+            store,
+            resolve_demo_workflow,
+            worker_id=worker_id,
+            observer=print_event,
+        )
+        try:
+            work = worker.run_once(
+                run_id=args.run_id,
+                lease_duration=timedelta(seconds=args.lease_seconds),
+                crash_before_commit=args.crash_before_commit,
+            )
+        except SimulatedCrash as error:
+            print(f"\n{error}; its lease must expire before another worker can claim it")
+            return 1
+        if work is None:
+            print("NO_WORK")
+            return 0
+        state = "RUN_COMPLETED" if work.run_completed else "STEP_COMPLETED"
+        print(f"{state} {work.run_id} {work.step_name} worker={worker_id}")
         return 0
 
     raise AssertionError(f"unhandled command: {args.command}")

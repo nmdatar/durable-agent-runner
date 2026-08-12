@@ -23,10 +23,7 @@ def test_new_process_resumes_after_last_completed_step(tmp_path) -> None:
     events: list[RunnerEvent] = []
     result = DurableRunner(store, observer=events.append).run(run_id, workflow)
 
-    assert events[:2] == [
-        RunnerEvent("skipped", "plan"),
-        RunnerEvent("skipped", "collect"),
-    ]
+    assert events[0] == RunnerEvent("claimed", "write_report")
     assert result.outputs["publish"] == "publication-1"
     assert store.get_run(run_id).status == "completed"
     assert [step.status for step in store.get_steps(run_id)] == ["succeeded"] * 4
@@ -44,27 +41,13 @@ def test_state_changes_have_matching_durable_events(tmp_path) -> None:
     assert event_types == [
         "run_created",
         "run_started",
-        "step_started",
+        "step_claimed",
         "step_completed",
-        "step_started",
+        "step_claimed",
         "step_completed",
-        "step_started",
+        "step_claimed",
         "step_completed",
-        "step_started",
+        "step_claimed",
         "step_completed",
         "run_completed",
     ]
-
-
-def test_interrupted_running_step_is_recovered_and_reexecuted(tmp_path) -> None:
-    store = make_store(tmp_path)
-    workflow = build_demo_workflow("Test task", DemoServices())
-    run_id = DurableRunner(store).create_run(workflow)
-    store.begin_or_resume_run(run_id)
-    store.start_step(run_id, "plan")
-
-    DurableRunner(store).run(run_id, workflow)
-
-    event_types = [event.event_type for event in store.get_events(run_id)]
-    assert "step_recovered" in event_types
-    assert store.get_steps(run_id)[0].status == "succeeded"

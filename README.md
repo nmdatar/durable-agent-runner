@@ -25,23 +25,32 @@ from which to resume yet. A crash after `publish` also illustrates a more subtle
 problem: the external effect may have happened even though the runner never
 recorded completion.
 
-## Durable workflow
+## Durable workflow with workers
 
-The SQLite-backed runner resumes at the first unfinished step. Initialize a local
-database and start a run that crashes after `collect`:
+The SQLite-backed scheduler stores work until a worker claims it. Initialize a local
+database and enqueue a run:
 
 ```bash
 uv run runner init
-uv run runner start demo --crash-after collect
+uv run runner start demo
 ```
 
-Copy the printed run ID, inspect its persisted state, and resume it:
+Copy the printed run ID. Each invocation below claims and executes one eligible step:
+
+```bash
+uv run runner worker --once --run-id <run-id>
+uv run runner worker --once --run-id <run-id>
+uv run runner worker --once --run-id <run-id>
+uv run runner worker --once --run-id <run-id>
+```
+
+Inspect current state or durable history at any point:
 
 ```bash
 uv run runner inspect <run-id>
 uv run runner events <run-id>
-uv run runner resume <run-id>
 ```
 
-The resumed process skips `plan` and `collect` because their outputs were committed
-to SQLite before the simulated crash.
+Every claim has an owner and expiration time. A second worker cannot execute the
+same step while its lease remains valid. Long-running workers heartbeat to extend
+their leases, while work held by a dead worker becomes claimable after expiration.
