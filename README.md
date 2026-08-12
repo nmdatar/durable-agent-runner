@@ -121,3 +121,15 @@ uv run runner start demo --max-attempts 6 --max-steps 4 \
 
 `inspect` shows accumulated usage and terminal reasons. Exceeding any limit fails
 the run before executing the step that would cross it.
+
+## Chaos recovery
+
+Run a deterministic campaign that kills fresh workers after claim, before commit,
+after commit, and after the publish side effect:
+
+```bash
+uv run runner chaos
+```
+
+The campaign advances expired leases, restarts with new workers, prints the durable
+event timeline, and verifies that every step succeeds with exactly one publication.

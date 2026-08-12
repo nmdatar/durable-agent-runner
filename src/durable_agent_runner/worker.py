@@ -85,7 +85,9 @@ class Worker:
         *,
         run_id: str | None = None,
         lease_duration: timedelta = timedelta(seconds=30),
+        crash_after_claim: str | None = None,
         crash_before_commit: str | None = None,
+        crash_after_commit: str | None = None,
     ) -> WorkResult | None:
         """Claim one eligible step, execute it, and commit its output."""
         claim = self._store.claim_next_step(
@@ -96,6 +98,9 @@ class Worker:
         )
         if claim is None:
             return None
+        if claim.step_name == crash_after_claim:
+            self._observer(RunnerEvent("crashed_after_claim", claim.step_name))
+            raise SimulatedCrash(f"{claim.step_name}:after_claim")
 
         workflow = self._resolve_workflow(claim)
         self._store.validate_workflow(
@@ -160,6 +165,9 @@ class Worker:
 
         run_completed = self._store.complete_claim(claim, output, now=self._clock())
         self._observer(RunnerEvent("completed", step.name))
+        if step.name == crash_after_commit:
+            self._observer(RunnerEvent("crashed_after_commit", step.name))
+            raise SimulatedCrash(f"{step.name}:after_commit")
         return WorkResult(
             claim.run_id,
             step.name,

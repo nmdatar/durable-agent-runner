@@ -7,6 +7,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from durable_agent_runner.artifacts import ArtifactManager
+from durable_agent_runner.chaos import run_chaos_campaign
 from durable_agent_runner.demo import DemoServices, build_demo_workflow
 from durable_agent_runner.durable_runner import DurableRunner
 from durable_agent_runner.operations import IdempotentPublisher
@@ -72,12 +73,17 @@ def build_parser() -> argparse.ArgumentParser:
     artifacts.add_argument("run_id")
     add_database_argument(artifacts)
 
+    chaos = subparsers.add_parser("chaos", help="run deterministic crash recovery checks")
+    add_database_argument(chaos)
+
     worker = subparsers.add_parser("worker", help="claim and execute queued work")
     worker.add_argument("--once", action="store_true", help="execute at most one step")
     worker.add_argument("--run-id", help="only claim work from this run")
     worker.add_argument("--worker-id", help="stable identity to record with the lease")
     worker.add_argument("--lease-seconds", type=int, default=30)
+    worker.add_argument("--crash-after-claim", choices=STEP_NAMES)
     worker.add_argument("--crash-before-commit", choices=STEP_NAMES)
+    worker.add_argument("--crash-after-commit", choices=STEP_NAMES)
     worker.add_argument(
         "--crash-after-side-effect",
         action="store_true",
@@ -241,6 +247,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         return 0
 
+    if args.command == "chaos":
+        store = open_store(args.db)
+        report = run_chaos_campaign(store, store.path.parent / "artifacts")
+        print(f"RUN_ID {report.run_id}")
+        for crash in report.injected_crashes:
+            print(f"INJECTED {crash}")
+        print(
+            f"RESULT status={report.status} "
+            f"publish_attempts={report.publish_attempts} "
+            f"publications={report.publication_count}"
+        )
+        print("TIMELINE")
+        for position, event_type in enumerate(report.event_types, start=1):
+            print(f"{position:04} {event_type}")
+        return 0
+
     if args.command == "worker":
         if not args.once:
             raise SystemExit("worker currently requires --once")
@@ -264,7 +286,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             work = worker.run_once(
                 run_id=args.run_id,
                 lease_duration=timedelta(seconds=args.lease_seconds),
+                crash_after_claim=args.crash_after_claim,
                 crash_before_commit=args.crash_before_commit,
+                crash_after_commit=args.crash_after_commit,
             )
         except SimulatedCrash as error:
             print(f"\n{error}; its lease must expire before another worker can claim it")
